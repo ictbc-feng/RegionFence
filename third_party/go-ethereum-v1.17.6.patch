@@ -1,0 +1,171 @@
+diff --git a/core/state/access_list.go b/core/state/access_list.go
+index 0b830e72..fb04bbd4 100644
+--- a/core/state/access_list.go
++++ b/core/state/access_list.go
+@@ -59,6 +59,15 @@ func newAccessList() *accessList {
+ 	}
+ }
+ 
++// reset empties the list, keeping its storage for reuse.
++func (al *accessList) reset() {
++	clear(al.addresses)
++	for i := range al.slots {
++		clear(al.slots[i])
++	}
++	al.slots = al.slots[:0]
++}
++
+ // Copy creates an independent copy of an accessList.
+ func (al *accessList) Copy() *accessList {
+ 	cp := &accessList{
+@@ -90,8 +99,16 @@ func (al *accessList) AddSlot(address common.Address, slot common.Hash) (addrCha
+ 	idx, addrPresent := al.addresses[address]
+ 	if !addrPresent || idx == -1 {
+ 		// Address not present, or addr present but no slots there
+-		al.addresses[address] = len(al.slots)
+-		slotmap := map[common.Hash]struct{}{slot: {}}
++		n := len(al.slots)
++		al.addresses[address] = n
++		var slotmap map[common.Hash]struct{}
++		if n < cap(al.slots) && al.slots[:n+1][n] != nil {
++			slotmap = al.slots[:n+1][n] // left by reset or a rollback: reuse its buckets
++			clear(slotmap)
++		} else {
++			slotmap = make(map[common.Hash]struct{}, 1)
++		}
++		slotmap[slot] = struct{}{}
+ 		al.slots = append(al.slots, slotmap)
+ 		return !addrPresent, true
+ 	}
+diff --git a/core/state/state_object.go b/core/state/state_object.go
+index ce456e76..bcd31203 100644
+--- a/core/state/state_object.go
++++ b/core/state/state_object.go
+@@ -98,6 +98,12 @@ func newObject(db *StateDB, address common.Address, acct *types.StateAccount) *s
+ 	if acct == nil {
+ 		acct = types.NewEmptyStateAccount()
+ 	}
++	if n := len(db.spare); n > 0 {
++		obj := db.spare[n-1]
++		db.spare = db.spare[:n-1]
++		obj.db, obj.address, obj.origin, obj.data = db, address, origin, *acct
++		return obj
++	}
+ 	return &stateObject{
+ 		db:                 db,
+ 		address:            address,
+@@ -507,6 +513,18 @@ func (s *stateObject) setBalance(amount *uint256.Int) {
+ 	s.data.Balance = amount
+ }
+ 
++// recycle clears the object for reuse by newObject (see StateDB.ResetForReader):
++// the storage maps keep their buckets.
++func (s *stateObject) recycle() {
++	s.db, s.addressHash, s.origin, s.trie, s.code = nil, nil, nil, nil, nil
++	s.address, s.data = common.Address{}, types.StateAccount{}
++	clear(s.originStorage)
++	clear(s.dirtyStorage)
++	clear(s.pendingStorage)
++	clear(s.uncommittedStorage)
++	s.dirtyCode, s.selfDestructed, s.newContract = false, false, false
++}
++
+ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
+ 	obj := &stateObject{
+ 		db:                 db,
+diff --git a/core/state/statedb.go b/core/state/statedb.go
+index b7716fe7..b8b8ef68 100644
+--- a/core/state/statedb.go
++++ b/core/state/statedb.go
+@@ -89,6 +89,7 @@ type StateDB struct {
+ 	// This map holds 'live' objects, which will get modified while
+ 	// processing a state transition.
+ 	stateObjects map[common.Address]*stateObject
++	spare        []*stateObject // recycled by ResetForReader, reused by newObject
+ 
+ 	// This map holds 'deleted' objects. An object with the same address
+ 	// might also occur in the 'stateObjects' map due to account
+@@ -184,6 +185,42 @@ func New(root common.Hash, db Database) (*StateDB, error) {
+ 
+ // NewWithReader creates a new state for the specified state root. Unlike New,
+ // this function accepts an additional Reader which is bound to the given root.
++// ResetForReader makes s equivalent to a fresh NewWithReader(root, db, reader)
++// while keeping the allocated maps, journal and access list storage, so a
++// caller executing many transactions on short-lived StateDBs (the RegionFence
++// executor runs one per transaction incarnation) can recycle them. s must not
++// be in use by any other goroutine.
++func (s *StateDB) ResetForReader(root common.Hash, db Database, reader Reader) {
++	s.db, s.reader, s.originalRoot = db, reader, root
++	s.prefetcher, s.trie, s.witness = nil, nil, nil
++	for _, obj := range s.stateObjects {
++		obj.recycle()
++		s.spare = append(s.spare, obj)
++	}
++	clear(s.stateObjects)
++	clear(s.stateObjectsDestruct)
++	clear(s.mutations)
++	s.dbErr = nil
++	s.refund = 0
++	s.thash, s.txIndex = common.Hash{}, 0
++	clear(s.logs)
++	s.logSize = 0
++	clear(s.preimages)
++	s.accessList.reset()
++	if s.accessEvents != nil || db.Type().Is(TypeUBT) {
++		s.accessEvents = NewAccessEvents()
++	}
++	s.stateAccessList, s.blockAccessIndex = nil, 0
++	clear(s.transientStorage)
++	s.journal.reset()
++	s.AccountReads, s.AccountHashes, s.AccountUpdates, s.AccountCommits = 0, 0, 0, 0
++	s.StorageReads, s.StorageUpdates, s.StorageCommits, s.DatabaseCommits, s.CodeReads = 0, 0, 0, 0, 0
++	s.AccountLoaded, s.AccountUpdated, s.AccountDeleted, s.StorageLoaded = 0, 0, 0, 0
++	s.StorageUpdated.Store(0)
++	s.StorageDeleted.Store(0)
++	s.CodeLoaded, s.CodeLoadBytes, s.CodeUpdated, s.CodeUpdateBytes = 0, 0, 0, 0
++}
++
+ func NewWithReader(root common.Hash, db Database, reader Reader) (*StateDB, error) {
+ 	sdb := &StateDB{
+ 		db:                   db,
+@@ -1497,8 +1534,13 @@ func (s *StateDB) Prepare(rules params.Rules, sender, coinbase common.Address, d
+ 		panic("eip2929 and eip4762 are both activated")
+ 	}
+ 	if rules.IsEIP2929 {
+-		// Clear out any leftover from previous executions
+-		al := newAccessList()
++		// Clear out any leftover from previous executions (reusing the storage)
++		al := s.accessList
++		if al == nil {
++			al = newAccessList()
++		} else {
++			al.reset()
++		}
+ 		s.accessList = al
+ 
+ 		al.AddAddress(sender)
+@@ -1520,7 +1562,11 @@ func (s *StateDB) Prepare(rules params.Rules, sender, coinbase common.Address, d
+ 		}
+ 	}
+ 	// Reset transient storage at the beginning of transaction execution
+-	s.transientStorage = newTransientStorage()
++	if s.transientStorage == nil {
++		s.transientStorage = newTransientStorage()
++	} else {
++		clear(s.transientStorage)
++	}
+ 
+ 	if rules.IsAmsterdam {
+ 		s.stateAccessList = bal.NewConstructionBlockAccessList()
+diff --git a/core/vm/interpreter.go b/core/vm/interpreter.go
+index c06cde7d..324e2ce6 100644
+--- a/core/vm/interpreter.go
++++ b/core/vm/interpreter.go
+@@ -33,6 +33,7 @@ type Config struct {
+ 	EnablePreimageRecording  bool  // Enables recording of SHA3/keccak preimages
+ 	ExtraEips                []int // Additional EIPS that are to be enabled
+ 	DisableParallelExecution bool  // Disable parallel block processing
++
+ }
+ 
+ // ScopeContext contains the things that are per-call, such as stack and memory,
